@@ -27,20 +27,21 @@ const ITEMS_5R = [
   { key:'rajin',   label:'Rajin (Shitsuke)',  desc:'Standar dijalankan secara konsisten' }
 ];
 
-const CATEGORIES = ['5R','GMP/Hygiene','Safety','Quality','Environment'];
+const CATEGORIES = ['Delivery','Quality','Safety','Efisiensi','Moral'];
+const DEPARTMENTS = ['IRGA','Produksi','Teknik / Maintenance','QC / QA','HSE','Gudang','Lainnya'];
 const PRIO_LABELS = { High:'Tinggi', Medium:'Sedang', Low:'Rendah' };
 const PRIO_DAYS   = { High: 1, Medium: 3, Low: 7 }; // escalation thresholds
 
 const USERS = {
   petugas: {
-    uid:'u1', displayName:'Budi Santoso', role:'petugas',
-    email:'budi.santoso@riski-hariyanto.id', jabatan:'Petugas Produksi',
-    initials:'BS', dept:'Produksi'
+    uid:'u1', displayName:'Riski Hariyanto', role:'petugas',
+    email:'riski.hariyanto@riski-hariyanto.id', jabatan:'Petugas Produksi',
+    initials:'RH', dept:'Produksi'
   },
   supervisor: {
-    uid:'u2', displayName:'Ahmad Hidayat', role:'supervisor',
-    email:'ahmad.hidayat@riski-hariyanto.id', jabatan:'Supervisor Produksi',
-    initials:'AH', dept:'Produksi'
+    uid:'u2', displayName:'Yanti Puspita', role:'supervisor',
+    email:'yanti.puspita@riski-hariyanto.id', jabatan:'Supervisor Produksi',
+    initials:'YP', dept:'Produksi'
   }
 };
 
@@ -63,14 +64,143 @@ let cfPhotoData  = null;
 let extraFindingIdCounter = 0;
 
 // ════════════════════════════════════════════════════════
-// LOCAL STORAGE HELPERS
+// FIREBASE + LOCAL STORAGE HYBRID BACKEND
 // ════════════════════════════════════════════════════════
+
+// ── Helpers: akses window.db yang di-inject oleh Firebase module di index.html ──
+function _db()      { return window.db || null; }
+function _col()     { return window.firebaseCollection; }
+function _setDoc()  { return window.firebaseSetDoc; }
+function _doc()     { return window.firebaseDoc; }
+function _snap()    { return window.firebaseOnSnapshot; }
+function _fbReady() { return !!(window.db && window.firebaseSetDoc && window.firebaseDoc && window.firebaseCollection && window.firebaseOnSnapshot); }
+
+// ── Status indikator sync (opsional, tampil di toast saat error) ──
+let _fbSyncError = false;
+
+// ── LocalStorage fallback (tetap dipakai sebagai cache offline) ──
 function getReports()  { try { return JSON.parse(localStorage.getItem('mr_v2_reports')||'[]'); } catch { return []; } }
 function saveReports(r){ localStorage.setItem('mr_v2_reports', JSON.stringify(r)); }
 function getNotifs()   { try { return JSON.parse(localStorage.getItem('mr_v2_notifs') ||'[]'); } catch { return []; } }
 function saveNotifs(n) { localStorage.setItem('mr_v2_notifs', JSON.stringify(n)); }
 
-function today() { return new Date().toISOString().split('T')[0]; }
+// ── Tulis satu laporan ke Firestore (collection: "reports", doc id = report.id) ──
+async function fbSaveReport(report) {
+  if (!_fbReady()) return;
+  try {
+    // Firestore tidak boleh menyimpan undefined — bersihkan dulu
+    const clean = JSON.parse(JSON.stringify(report));
+    await _setDoc()(_doc()(_db(), 'reports', clean.id), clean);
+  } catch (e) {
+    console.error('[Firebase] Gagal menyimpan laporan:', e);
+    if (!_fbSyncError) { _fbSyncError = true; toast('⚠ Sync Firebase gagal, data tersimpan lokal', 'yellow'); }
+  }
+}
+
+// ── Tulis satu notif ke Firestore (collection: "notifs", doc id = notif.id) ──
+async function fbSaveNotif(notif) {
+  if (!_fbReady()) return;
+  try {
+    const clean = JSON.parse(JSON.stringify(notif));
+    await _setDoc()(_doc()(_db(), 'notifs', clean.id), clean);
+  } catch (e) {
+    console.error('[Firebase] Gagal menyimpan notif:', e);
+  }
+}
+
+// ── Realtime listener: Firestore → LocalStorage → re-render UI ──
+function initFirebaseListeners() {
+  if (!_fbReady()) {
+    // Coba lagi setelah 1 detik (Firebase module mungkin belum selesai load)
+    setTimeout(initFirebaseListeners, 1000);
+    return;
+  }
+
+  // Listener untuk collection "reports"
+  _snap()(_col()(_db(), 'reports'), (snapshot) => {
+    try {
+      const fbReports = [];
+      snapshot.forEach(docSnap => fbReports.push(docSnap.data()));
+
+      // Merge: ambil data Firebase sebagai sumber kebenaran
+      // tapi tetap simpan ke localStorage sebagai cache offline
+      saveReports(fbReports);
+      _fbSyncError = false;
+
+      // Re-render screen yang sedang aktif
+      const activeScreen = ALL_SCREENS.find(s => {
+        const el = document.getElementById(s);
+        return el && el.classList.contains('active');
+      });
+      if (activeScreen === 's-dashboard')     renderDashboard();
+      if (activeScreen === 's-history')       renderHistory();
+      if (activeScreen === 's-supervisor')    renderSupervisorDash();
+      if (activeScreen === 's-open-findings') renderOpenFindings();
+    } catch (e) {
+      console.error('[Firebase] Error saat memproses snapshot reports:', e);
+    }
+  }, (err) => {
+    console.error('[Firebase] Listener reports error:', err);
+    toast('⚠ Koneksi Firebase terputus, mode offline aktif', 'yellow');
+  });
+
+  // Listener untuk collection "notifs"
+  _snap()(_col()(_db(), 'notifs'), (snapshot) => {
+    try {
+      const fbNotifs = [];
+      snapshot.forEach(docSnap => fbNotifs.push(docSnap.data()));
+      // Urutkan: terbaru di depan
+      fbNotifs.sort((a, b) => (b.id || '').localeCompare(a.id || ''));
+      saveNotifs(fbNotifs);
+
+      // Update notif dot
+      const unread = fbNotifs.filter(n => !n.read).length;
+      ['dash-notif-dot','sup-notif-dot'].forEach(id => {
+        const el = document.getElementById(id);
+        if (el) el.style.display = unread ? 'block' : 'none';
+      });
+
+      const activeScreen = ALL_SCREENS.find(s => {
+        const el = document.getElementById(s);
+        return el && el.classList.contains('active');
+      });
+      if (activeScreen === 's-notif') renderNotifs();
+    } catch (e) {
+      console.error('[Firebase] Error saat memproses snapshot notifs:', e);
+    }
+  }, (err) => {
+    console.error('[Firebase] Listener notifs error:', err);
+  });
+
+  console.log('[Firebase] Realtime listeners aktif ✅');
+}
+
+// ── Override saveReports: simpan ke localStorage DAN Firestore ──
+// Dipanggil setiap kali ada perubahan pada array laporan
+const _origSaveReports = saveReports;
+saveReports = function(reportsArray) {
+  _origSaveReports(reportsArray);
+  // Sinkronisasi setiap laporan yang ada ke Firestore
+  // (Firestore pakai setDoc/merge jadi aman untuk update parsial)
+  if (_fbReady() && Array.isArray(reportsArray)) {
+    reportsArray.forEach(r => fbSaveReport(r));
+  }
+};
+
+// ── Override saveNotifs: simpan ke localStorage DAN Firestore ──
+const _origSaveNotifs = saveNotifs;
+saveNotifs = function(notifsArray) {
+  _origSaveNotifs(notifsArray);
+  if (_fbReady() && Array.isArray(notifsArray)) {
+    notifsArray.forEach(n => fbSaveNotif(n));
+  }
+};
+
+function today() { 
+  const d = new Date();
+  // Mengambil tanggal lokal HP, bukan waktu UTC
+  return d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0') + '-' + String(d.getDate()).padStart(2, '0');
+}
 function todayLabel() { return new Date().toLocaleDateString('id-ID', { weekday:'long', day:'numeric', month:'long', year:'numeric' }); }
 function fmtDate(d)   { return new Date(d).toLocaleDateString('id-ID', { day:'2-digit', month:'short', year:'numeric' }); }
 
@@ -182,7 +312,7 @@ function quickLogin(role) {
 
 function doLogin() {
   const email = document.getElementById('l-email')?.value.trim() || '';
-  currentUser = email.toLowerCase().includes('ahmad') ? USERS.supervisor : USERS.petugas;
+  currentUser = email.toLowerCase().includes('yanti') ? USERS.supervisor : USERS.petugas;
   localStorage.setItem('mr_v2_user', JSON.stringify(currentUser));
   enterApp();
   toast('Login berhasil!', 'lime');
@@ -495,7 +625,7 @@ function openCloseFinding(reportId, findingKey, isExtra) {
 }
 
 function selectCapaTab(idx, btn) {
-  [0,1,2].forEach(i => {
+  [0,1].forEach(i => {
     const el = document.getElementById('capa-tab-' + i);
     if (el) el.style.display = i === idx ? 'block' : 'none';
   });
@@ -504,16 +634,15 @@ function selectCapaTab(idx, btn) {
   });
 }
 
+// 3. REVISI handleCloseFindingPhoto
 function handleCloseFindingPhoto(input) {
   const file = input.files[0]; if (!file) return;
-  const reader = new FileReader();
-  reader.onload = e => {
-    cfPhotoData = e.target.result;
+  compressImage(file, (compressedData) => {
+    cfPhotoData = compressedData;
     const prev = document.getElementById('close-finding-photo-prev');
-    if (prev) prev.innerHTML = `<img src="${e.target.result}" style="width:100%;max-height:80px;object-fit:cover;border:var(--border);border-radius:var(--radius);margin-top:4px">
+    if (prev) prev.innerHTML = `<img src="${compressedData}" style="width:100%;max-height:80px;object-fit:cover;border:var(--border);border-radius:var(--radius);margin-top:4px">
       <button onclick="cfPhotoData=null;document.getElementById('close-finding-photo-prev').innerHTML=''" style="font-size:10px;color:var(--red);background:none;border:none;cursor:pointer;font-weight:700;margin-top:2px">Hapus</button>`;
-  };
-  reader.readAsDataURL(file);
+  });
 }
 
 function submitCloseFinding() {
@@ -564,8 +693,9 @@ function submitCloseFinding() {
   });
 
   saveReports(reps);
-
-  // Add notification if closed
+  // Push laporan yang diupdate ke Firebase secara eksplisit
+  const updatedReport = reps.find(r => r.id === cfReportId);
+  if (updatedReport) fbSaveReport(updatedReport);
   if (status === 'Closed') {
     const notifs = getNotifs();
     notifs.unshift({ id:'n-'+Date.now(), type:'finding_closed', title:'Temuan berhasil ditutup', body:`${cfFindingKey} — ${cfReportId}`, time: new Date().toLocaleTimeString('id-ID',{hour:'2-digit',minute:'2-digit'})+' WIB', read:false });
@@ -607,7 +737,7 @@ function build5R() {
           <div>
             <label class="nb-label">Kategori</label>
             <select class="nb-select" id="fd-cat-${item.key}" onchange="syncFinding('${item.key}')">
-              ${CATEGORIES.map(c => `<option value="${c}" ${(findingsData[item.key]?.category||'5R')===c?'selected':''}>${c}</option>`).join('')}
+              ${CATEGORIES.map(c => `<option value="${c}" ${(findingsData[item.key]?.category||'Delivery')===c?'selected':''}>${c}</option>`).join('')}
             </select>
           </div>
           <div>
@@ -618,6 +748,13 @@ function build5R() {
               <option value="High"   ${(findingsData[item.key]?.urgency||'Medium')==='High'  ?'selected':''}>🔴 Tinggi</option>
             </select>
           </div>
+        </div>
+        <div style="margin-bottom:7px">
+          <label class="nb-label">Departemen (DEPT)</label>
+          <select class="nb-select" id="fd-dept-${item.key}" onchange="syncFinding('${item.key}')">
+            <option value="">— Pilih Dept —</option>
+            ${DEPARTMENTS.map(d => `<option value="${d}" ${(findingsData[item.key]?.dept||'')===d?'selected':''}>${d}</option>`).join('')}
+          </select>
         </div>
         <label class="nb-label">Deskripsi Temuan *</label>
         <textarea class="nb-textarea" id="fd-desc-${item.key}" rows="2"
@@ -657,7 +794,7 @@ function set5R(key, val, btn) {
   if (panel) {
     if (val === 'no') {
       panel.classList.add('open');
-      if (!findingsData[key]) findingsData[key] = { description:'', urgency:'Medium', category:'5R', status:'Open', dueDate: getDefaultDue('Medium') };
+      if (!findingsData[key]) findingsData[key] = { description:'', urgency:'Medium', category:'Delivery', dept:'', status:'Open', dueDate: getDefaultDue('Medium') };
     } else {
       panel.classList.remove('open');
       delete findingsData[key];
@@ -667,27 +804,28 @@ function set5R(key, val, btn) {
 
 function syncFinding(key) {
   if (!findingsData[key]) findingsData[key] = { status:'Open' };
-  const d   = document.getElementById('fd-desc-' + key);
-  const u   = document.getElementById('fd-urg-'  + key);
-  const cat = document.getElementById('fd-cat-'  + key);
-  const due = document.getElementById('fd-due-'  + key);
-  if (d)   findingsData[key].description = d.value;
-  if (u)   findingsData[key].urgency     = u.value;
-  if (cat) findingsData[key].category    = cat.value;
-  if (due) findingsData[key].dueDate     = due.value;
+  const d    = document.getElementById('fd-desc-' + key);
+  const u    = document.getElementById('fd-urg-'  + key);
+  const cat  = document.getElementById('fd-cat-'  + key);
+  const due  = document.getElementById('fd-due-'  + key);
+  const dept = document.getElementById('fd-dept-' + key);
+  if (d)    findingsData[key].description = d.value;
+  if (u)    findingsData[key].urgency     = u.value;
+  if (cat)  findingsData[key].category    = cat.value;
+  if (due)  findingsData[key].dueDate     = due.value;
+  if (dept) findingsData[key].dept        = dept.value;
 }
 
+// 2. REVISI handleFindingPhoto
 function handleFindingPhoto(input, key) {
   const file = input.files[0]; if (!file) return;
-  const reader = new FileReader();
-  reader.onload = e => {
+  compressImage(file, (compressedData) => {
     if (!findingsData[key]) findingsData[key] = { status:'Open' };
-    findingsData[key].photo = e.target.result;
+    findingsData[key].photo = compressedData;
     const prev = document.getElementById('fd-photo-prev-' + key);
-    if (prev) prev.innerHTML = `<img src="${e.target.result}" style="width:100%;max-height:55px;object-fit:cover;border:var(--border);border-radius:3px">
+    if (prev) prev.innerHTML = `<img src="${compressedData}" style="width:100%;max-height:55px;object-fit:cover;border:var(--border);border-radius:3px">
       <button onclick="removeFindingPhoto('${key}')" style="font-size:9px;color:var(--red);background:none;border:none;cursor:pointer;font-weight:700;margin-top:2px">Hapus</button>`;
-  };
-  reader.readAsDataURL(file);
+  });
 }
 
 function removeFindingPhoto(key) {
@@ -700,7 +838,7 @@ function removeFindingPhoto(key) {
 // ════════════════════════════════════════════════════════
 function addExtraFinding() {
   const id = 'ef-' + (++extraFindingIdCounter);
-  extraFindings.push({ id, label:'', category:'GMP/Hygiene', priority:'Medium', description:'', dueDate: getDefaultDue('Medium'), status:'Open', photo: null });
+  extraFindings.push({ id, label:'', category:'Quality', dept:'', priority:'Medium', description:'', dueDate: getDefaultDue('Medium'), status:'Open', photo: null });
   renderExtraFindings();
 }
 
@@ -734,6 +872,13 @@ function renderExtraFindings() {
             <option value="High" ${ef.priority==='High'?'selected':''}>🔴 Tinggi</option>
           </select>
         </div>
+      </div>
+      <div style="margin-bottom:6px">
+        <label class="nb-label">Departemen (DEPT)</label>
+        <select class="nb-select" onchange="updateExtraFinding('${ef.id}','dept',this.value)">
+          <option value="">— Pilih Dept —</option>
+          ${DEPARTMENTS.map(d => `<option value="${d}" ${ef.dept===d?'selected':''}>${d}</option>`).join('')}
+        </select>
       </div>
       <label class="nb-label">Deskripsi</label>
       <textarea class="nb-textarea" rows="2" placeholder="Detail temuan..." style="margin-bottom:6px" oninput="updateExtraFinding('${ef.id}','description',this.value)">${ef.description}</textarea>
@@ -772,20 +917,48 @@ function selShift(btn, shift) {
 // ════════════════════════════════════════════════════════
 // PHOTO CAPTURE
 // ════════════════════════════════════════════════════════
+
+// Fungsi Pembantu Kompresi Gambar
+function compressImage(file, callback) {
+  const reader = new FileReader();
+  reader.onload = e => {
+    const img = new Image();
+    img.onload = () => {
+      const canvas = document.createElement('canvas');
+      let { width, height } = img;
+      const maxSize = 800; // Maksimal 800px
+
+      if (width > height && width > maxSize) {
+        height = Math.round(height * maxSize / width); width = maxSize;
+      } else if (height > maxSize) {
+        width = Math.round(width * maxSize / height); height = maxSize;
+      }
+      
+      canvas.width = width; canvas.height = height;
+      const ctx = canvas.getContext('2d');
+      ctx.drawImage(img, 0, 0, width, height);
+      
+      // Kualitas 0.6 (60%) agar size sangat kecil (puluhan KB saja)
+      callback(canvas.toDataURL('image/jpeg', 0.6));
+    };
+    img.src = e.target.result;
+  };
+  reader.readAsDataURL(file);
+}
+
 function triggerPhoto(type) {
   document.getElementById('file-' + type).click();
 }
 
+// 1. REVISI handlePhotoUpload
 function handlePhotoUpload(input, type) {
   const file = input.files[0]; if (!file) return;
-  const reader = new FileReader();
-  reader.onload = e => {
-    photoData[type] = e.target.result;
+  compressImage(file, (compressedData) => {
+    photoData[type] = compressedData;
     const box = document.getElementById('pb-' + type);
     box.classList.add('filled');
-    box.innerHTML = `<img src="${e.target.result}"><div class="photo-label">${type==='before'?'SEBELUM':'SESUDAH'} ✓</div>`;
-  };
-  reader.readAsDataURL(file);
+    box.innerHTML = `<img src="${compressedData}"><div class="photo-label">${type==='before'?'SEBELUM':'SESUDAH'} ✓</div>`;
+  });
 }
 
 // ════════════════════════════════════════════════════════
@@ -819,6 +992,14 @@ function submitForm(isDraft) {
       }
     });
     if (fdErr) return;
+
+    // Validasi Extra Findings
+    const invalidExtra = extraFindings.find(ef => !ef.label.trim() || !ef.description.trim());
+    if (invalidExtra) {
+      errEl.style.display = 'block'; 
+      errEl.textContent = 'Label dan Deskripsi pada semua Temuan Tambahan wajib diisi!'; 
+      return;
+    }
   }
   errEl.style.display = 'none';
 
@@ -924,7 +1105,7 @@ function renderHistory() {
 
     const card = document.createElement('div');
     card.className = 'hist-card';
-    card.onclick = () => openDetail(r.id);
+    card.onclick = () => isDraft ? resumeDraft(r.id) : openDetail(r.id);
     card.innerHTML = `
       <div style="display:flex">
         <div style="width:6px;background:${stBg};flex-shrink:0"></div>
@@ -944,6 +1125,44 @@ function renderHistory() {
       </div>`;
     cont.appendChild(card);
   });
+}
+
+function resumeDraft(reportId) {
+  const reps = getReports();
+  const r = reps.find(x => x.id === reportId);
+  if (!r) return;
+
+  // Tarik data ke form
+  document.getElementById('form-area').value = r.area;
+  currentShift = r.shift;
+  ['shift-pagi','shift-siang','shift-malam'].forEach(id => document.getElementById(id)?.classList.remove('sel-ok'));
+  document.getElementById('shift-' + r.shift.toLowerCase())?.classList.add('sel-ok');
+  document.getElementById('form-shift-badge').textContent = r.shift;
+  
+  cl5R = { ...r.checklist };
+  findingsData = JSON.parse(JSON.stringify(r.findings || {}));
+  extraFindings = JSON.parse(JSON.stringify(r.extraFindings || []));
+  photoData = { before: r.foto_before, after: r.foto_after };
+  document.getElementById('form-catatan').value = r.catatan || '';
+
+  // Render ulang UI form
+  build5R();
+  renderExtraFindings();
+
+  if (photoData.before) {
+    const box = document.getElementById('pb-before');
+    box.classList.add('filled'); box.innerHTML = `<img src="${photoData.before}"><div class="photo-label">SEBELUM ✓</div>`;
+  }
+  if (photoData.after) {
+    const box = document.getElementById('pb-after');
+    box.classList.add('filled'); box.innerHTML = `<img src="${photoData.after}"><div class="photo-label">SESUDAH ✓</div>`;
+  }
+
+  // Hapus draft lama agar tidak double saat di-submit ulang
+  saveReports(reps.filter(x => x.id !== reportId));
+  
+  goTo('s-form');
+  toast('Melanjutkan draft sebelumnya...', 'yellow');
 }
 
 // ════════════════════════════════════════════════════════
@@ -1033,16 +1252,16 @@ function openDetail(reportId) {
   if (r.verified) {
     verifHtml = `<div class="nb-card" style="padding:11px;border-left:4px solid var(--blue);margin-bottom:12px">
       <div style="display:flex;align-items:center;gap:9px">
-        <div class="profile-avatar" style="width:34px;height:34px;font-size:12px;background:var(--blue);color:#fff">AH</div>
+        <div class="profile-avatar" style="width:34px;height:34px;font-size:12px;background:var(--blue);color:#fff">YP</div>
         <div><div style="font-size:13px;font-weight:700">${USERS.supervisor.displayName}</div><div style="font-size:10px;color:var(--muted);font-family:'DM Mono',monospace">${USERS.supervisor.jabatan}</div></div>
         <span class="nb-badge" style="margin-left:auto;background:${r.verif_action==='approve'?'var(--lime)':'var(--red)'};color:${r.verif_action==='approve'?'var(--black)':'#fff'};border-color:${r.verif_action==='approve'?'var(--lime)':'var(--red)'};font-size:8px">${r.verif_action==='approve'?'DISETUJUI':'DITOLAK'}</span>
       </div>
       ${r.verif_catatan ? `<div style="margin-top:9px;padding-top:9px;border-top:1px dashed #ddd;font-size:12px;color:#555"><b>Catatan:</b> ${r.verif_catatan}</div>` : ''}
     </div>`;
   } else if (currentUser?.role === 'supervisor') {
-    verifHtml = `<button class="nb-btn nb-btn-blue nb-btn-full" style="margin-bottom:8px" onclick="openVerif('${r.id}');goTo('s-verif')"><i class="ti ti-shield-check"></i> Verifikasi Laporan Ini</button>`;
+    verifHtml = `<button class="nb-btn nb-btn-blue nb-btn-full" style="margin-bottom:8px" onclick="openVerif('${r.id}');goTo('s-verif')"><i class="ti ti-shield-check"></i> Approve sebagai FM / Dept Head</button>`;
   } else {
-    verifHtml = `<div style="text-align:center;padding:10px;border:var(--border);border-radius:var(--radius);background:var(--white);margin-bottom:12px"><span class="nb-badge" style="background:var(--yellow);font-size:10px">Menunggu Verifikasi Supervisor</span></div>`;
+    verifHtml = `<div style="text-align:center;padding:10px;border:var(--border);border-radius:var(--radius);background:var(--white);margin-bottom:12px"><span class="nb-badge" style="background:var(--yellow);font-size:10px">Menunggu Persetujuan FM / Dept Head</span></div>`;
   }
 
   const totalF = fdKeys.length + extraF.length;
@@ -1097,7 +1316,7 @@ function openDetail(reportId) {
 
     ${r.catatan ? `<div class="sec-hdr">Catatan</div><div class="nb-card" style="padding:11px;margin-bottom:10px"><div style="font-size:12px;color:#555">${r.catatan}</div></div>` : ''}
 
-    <div class="sec-hdr">Verifikasi Atasan</div>
+    <div class="sec-hdr">Persetujuan FM / Dept Head</div>
     ${verifHtml}
     <div style="height:14px"></div>`;
 
@@ -1262,7 +1481,7 @@ function openVerif(reportId) {
     <div class="sec-hdr">Hasil Checklist 5R</div>
     <div class="nb-card" style="padding:11px;margin-bottom:10px">${checkSum}</div>
     ${findSum}
-    <div class="sec-hdr" style="margin-top:10px">Keputusan Verifikasi</div>
+    <div class="sec-hdr" style="margin-top:10px">Keputusan FM / Dept Head</div>
     ${verifAction}
     <div style="height:14px"></div>`;
 
@@ -1303,6 +1522,9 @@ function doVerif(action) {
     return r;
   });
   saveReports(reps);
+  // Push laporan yang diverifikasi ke Firebase secara eksplisit
+  const updatedRep = reps.find(r => r.id === selectedReport.id);
+  if (updatedRep) fbSaveReport(updatedRep);
   const notifs = getNotifs();
   notifs.unshift({ id:'n-'+Date.now(), type:'verif_done', title:`Laporan ${action==='approve'?'disetujui':'ditolak'}`, body: selectedReport.area + ' — ' + selectedReport.user.displayName, time: new Date().toLocaleTimeString('id-ID',{hour:'2-digit',minute:'2-digit'})+' WIB', read:false });
   saveNotifs(notifs);
@@ -1394,16 +1616,21 @@ function exportPDF() {
   const data = reps.map(r => {
     const totalF = Object.keys(r.findings||{}).length + (r.extraFindings||[]).length;
     const openF  = Object.values(r.findings||{}).filter(f=>f.status!=='Closed').length + (r.extraFindings||[]).filter(ef=>ef.status!=='Closed').length;
-    return [ r.tanggal, r.area, r.user.displayName, r.shift, r.skor5r+'%', r.status, r.verified?'Ya':'Tidak', totalF+' ('+openF+' open)' ];
+    const cats = [
+      ...Object.values(r.findings||{}).map(f=>f.category),
+      ...(r.extraFindings||[]).map(ef=>ef.category)
+    ].filter(Boolean);
+    const catSummary = [...new Set(cats)].join(', ') || '—';
+    return [ r.tanggal, r.area, r.user.displayName, r.shift, r.skor5r+'%', r.status, r.verified?'Ya':'Tidak', totalF+' ('+openF+' open)', catSummary ];
   });
 
   doc.autoTable({
     startY: 28,
-    head: [['Tanggal','Area','Petugas','Shift','Skor 5R','Status','Verif','Temuan']],
+    head: [['Tanggal','Area','Petugas','Shift','Skor 5R','Status','Verif FM','Temuan','Kategori']],
     body: data,
-    styles: { fontSize: 6.5 },
+    styles: { fontSize: 6 },
     headStyles: { fillColor: [17,17,17], textColor: 255, fontStyle: 'bold' },
-    columnStyles: { 0:{cellWidth:22}, 1:{cellWidth:34}, 2:{cellWidth:26}, 3:{cellWidth:12}, 4:{cellWidth:15}, 5:{cellWidth:18}, 6:{cellWidth:12}, 7:{cellWidth:20} }
+    columnStyles: { 0:{cellWidth:20}, 1:{cellWidth:30}, 2:{cellWidth:24}, 3:{cellWidth:11}, 4:{cellWidth:14}, 5:{cellWidth:16}, 6:{cellWidth:12}, 7:{cellWidth:18}, 8:{cellWidth:22} }
   });
 
   doc.save('MorningRound_' + today() + '.pdf');
@@ -1422,18 +1649,22 @@ function exportSinglePDF() {
   doc.setFont('helvetica','normal'); doc.setFontSize(8);
   doc.text('PT. RISKI HARIYANTO', 14, 22);
   doc.text(`Area: ${r.area} | ${r.tanggal} | Shift: ${r.shift} | Petugas: ${r.user.displayName}`, 14, 28);
-  doc.text(`Skor 5R: ${r.skor5r}% | Status: ${r.status} | Verifikasi: ${r.verified ? (r.verif_action==='approve'?'DISETUJUI':'DITOLAK') : 'Belum'}`, 14, 34);
+  doc.text(`Skor 5R: ${r.skor5r}% | Status: ${r.status} | Persetujuan FM / Dept Head: ${r.verified ? (r.verif_action==='approve'?'DISETUJUI':'DITOLAK') : 'Belum'}`, 14, 34);
 
   const checkData = ITEMS_5R.map(i => [i.label, r.checklist?.[i.key]==='ok'?'OK':r.checklist?.[i.key]==='no'?'TIDAK':'N/A']);
   doc.autoTable({ startY:40, head:[['Item 5R','Hasil']], body:checkData, styles:{fontSize:7.5}, headStyles:{fillColor:[17,17,17],textColor:255}, columnStyles:{0:{cellWidth:80},1:{cellWidth:25}} });
 
   const allF = [
-    ...Object.keys(r.findings||{}).map(k => { const f=r.findings[k]; const item=ITEMS_5R.find(i=>i.key===k); return [item?.label||k, f.category||'5R', PRIO_LABELS[f.urgency]||f.urgency||'—', f.status, f.dueDate||'—', f.description||'—']; }),
-    ...(r.extraFindings||[]).map(ef => [ef.label||'Temuan', ef.category||'5R', PRIO_LABELS[ef.priority]||ef.priority||'—', ef.status, ef.dueDate||'—', ef.description||'—'])
+    ...Object.keys(r.findings||{}).map(k => {
+      const f=r.findings[k];
+      const item=ITEMS_5R.find(i=>i.key===k);
+      return [item?.label||k, f.dept||'—', f.category||'—', PRIO_LABELS[f.urgency]||f.urgency||'—', f.status, f.dueDate||'—', f.description||'—'];
+    }),
+    ...(r.extraFindings||[]).map(ef => [ef.label||'Temuan', ef.dept||'—', ef.category||'—', PRIO_LABELS[ef.priority]||ef.priority||'—', ef.status, ef.dueDate||'—', ef.description||'—'])
   ];
 
   if (allF.length) {
-    doc.autoTable({ startY: doc.lastAutoTable.finalY + 8, head:[['Item','Kategori','Prioritas','Status','Target','Deskripsi']], body:allF, styles:{fontSize:6.5}, headStyles:{fillColor:[17,17,17],textColor:255} });
+    doc.autoTable({ startY: doc.lastAutoTable.finalY + 8, head:[['Item','DEPT','Kategori','Prioritas','Status','Target','Deskripsi']], body:allF, styles:{fontSize:6}, headStyles:{fillColor:[17,17,17],textColor:255} });
   }
 
   doc.save(`MR_${r.area.replace(/ /g,'_')}_${r.tanggal}.pdf`);
@@ -1510,4 +1741,7 @@ function initForm() {
 
   updateClock();
   setInterval(updateClock, 30000);
+
+  // Aktifkan Firebase realtime listeners
+  initFirebaseListeners();
 })();
