@@ -35,12 +35,12 @@
         <button class="nb-btn nb-btn-black nb-btn-full" onclick="quickLogin('supervisor')" style="flex-direction:column;padding:11px 8px;gap:2px">
           <i class="ti ti-shield-check" style="font-size:16px"></i>
           <span style="font-size:11px">Supervisor</span>
-          <span style="font-size:9px;font-weight:400;opacity:.6;text-transform:none;font-family:inherit">Ahmad Hidayat</span>
+          <span style="font-size:9px;font-weight:400;opacity:.6;text-transform:none;font-family:inherit">Yanti Puspita</span>
         </button>
         <button class="nb-btn nb-btn-yellow nb-btn-full" onclick="quickLogin('petugas')" style="flex-direction:column;padding:11px 8px;gap:2px">
           <i class="ti ti-user-check" style="font-size:16px"></i>
           <span style="font-size:11px">Petugas</span>
-          <span style="font-size:9px;font-weight:400;opacity:.6;text-transform:none;font-family:inherit">Budi Santoso</span>
+          <span style="font-size:9px;font-weight:400;opacity:.6;text-transform:none;font-family:inherit">Riski Hariyanto</span>
         </button>
       </div>
       <div style="display:flex;align-items:center;gap:8px;margin-bottom:10px">
@@ -342,37 +342,36 @@
       </div>
 
       <!-- CAPA Tabs -->
-      <div class="sec-hdr">Struktur Tindakan Perbaikan (PDCA)</div>
+      <div class="sec-hdr">Rekomendasi &amp; Action Plan</div>
       <div class="capa-tab">
-        <button class="capa-tab-btn active" onclick="selectCapaTab(0,this)">Immediate</button>
-        <button class="capa-tab-btn" onclick="selectCapaTab(1,this)">Corrective</button>
-        <button class="capa-tab-btn" onclick="selectCapaTab(2,this)">Preventive</button>
+        <button class="capa-tab-btn active" onclick="selectCapaTab(0,this)">Rekomendasi (Saran Perbaikan)</button>
+        <button class="capa-tab-btn" onclick="selectCapaTab(1,this)">Action Plan (Tindakan Eksekusi)</button>
       </div>
 
       <div id="capa-tab-0" class="capa-section" style="margin-bottom:10px">
-        <div style="font-size:11px;font-weight:700;margin-bottom:8px;color:var(--orange)">⚡ Tindakan Langsung (Immediate Action)</div>
-        <label class="nb-label">Apa yang dilakukan sekarang?</label>
-        <textarea class="nb-textarea" id="capa-immediate" rows="2" placeholder="Contoh: Kotoran dibersihkan langsung oleh operator, mesin dimatikan sementara..."></textarea>
+        <div style="font-size:11px;font-weight:700;margin-bottom:8px;color:var(--orange)">💡 Rekomendasi (Saran Perbaikan)</div>
+        <label class="nb-label">Apa yang disarankan untuk dilakukan?</label>
+        <textarea class="nb-textarea" id="capa-immediate" rows="2" placeholder="Contoh: Bersihkan area secara menyeluruh, laporkan ke kepala shift, pasang rambu peringatan..."></textarea>
       </div>
       <div id="capa-tab-1" class="capa-section" style="margin-bottom:10px;display:none">
-        <div style="font-size:11px;font-weight:700;margin-bottom:8px;color:var(--blue)">🔧 Tindakan Korektif (Corrective Action)</div>
-        <label class="nb-label">Perbaikan teknis yang dijadwalkan</label>
-        <textarea class="nb-textarea" id="capa-corrective" rows="2" placeholder="Contoh: Maintenance dijadwalkan Senin 07:00, spare part dipesan..."></textarea>
-        <label class="nb-label" style="margin-top:8px">PIC (Penanggung Jawab)</label>
+        <div style="font-size:11px;font-weight:700;margin-bottom:8px;color:var(--blue)">🔧 Action Plan (Tindakan Eksekusi)</div>
+        <label class="nb-label">Tindakan konkret yang akan dijalankan</label>
+        <textarea class="nb-textarea" id="capa-corrective" rows="2" placeholder="Contoh: Maintenance dijadwalkan Senin 07:00, spare part dipesan, briefing ulang tim..."></textarea>
+        <label class="nb-label" style="margin-top:8px">PIC (Departemen Penanggung Jawab)</label>
         <select class="nb-select" id="capa-corrective-pic">
           <option value="">— Pilih Departemen PIC —</option>
-          <option>Maintenance / Teknik</option>
+          <option>IRGA</option>
           <option>Produksi</option>
+          <option>Teknik / Maintenance</option>
           <option>QC / QA</option>
           <option>HSE</option>
           <option>Gudang</option>
           <option>Lainnya</option>
         </select>
       </div>
-      <div id="capa-tab-2" class="capa-section" style="margin-bottom:10px;display:none">
-        <div style="font-size:11px;font-weight:700;margin-bottom:8px;color:var(--purple)">🛡 Tindakan Pencegahan (Preventive Action)</div>
-        <label class="nb-label">Analisis akar masalah & pencegahan</label>
-        <textarea class="nb-textarea" id="capa-preventive" rows="2" placeholder="Contoh: Briefing ulang dilakukan, SOP diperbarui, modifikasi mesin direncanakan..."></textarea>
+      <!-- Tab Preventive disembunyikan (sesuai 2 kolom PDF standar) -->
+      <div id="capa-tab-2" class="capa-section" style="display:none">
+        <textarea class="nb-textarea" id="capa-preventive" rows="2" style="display:none"></textarea>
       </div>
 
       <!-- Status & Due Date -->
@@ -578,6 +577,36 @@
 <div id="toast-zone" style="position:absolute;bottom:85px;left:10px;right:10px;z-index:300;display:flex;flex-direction:column;gap:7px;pointer-events:none;"></div>
 
 </div><!-- end device-frame -->
+
+<script type="module">
+  import { initializeApp } from "https://www.gstatic.com/firebasejs/10.8.1/firebase-app.js";
+  import { getFirestore, enableIndexedDbPersistence, collection, onSnapshot, setDoc, doc } from "https://www.gstatic.com/firebasejs/10.8.1/firebase-firestore.js";
+
+  const firebaseConfig = {
+    apiKey: "AIzaSyD3Ap1mCuDiNQ_jzLBNAuyr7Vp2U1lzBdA",
+    authDomain: "mr-riski.firebaseapp.com",
+    projectId: "mr-riski",
+    storageBucket: "mr-riski.firebasestorage.app",
+    messagingSenderId: "89744831579",
+    appId: "1:89744831579:web:4e804d5c9c8e9eaae1fb7e"
+  };
+
+  // Inisialisasi Firebase & Firestore
+  const app = initializeApp(firebaseConfig);
+  const db = getFirestore(app);
+
+  // Aktifkan Offline Mode (Bisa dipakai tanpa sinyal internet)
+  enableIndexedDbPersistence(db).catch((err) => {
+    console.log("Firebase Offline Mode Error: ", err.code);
+  });
+
+  // Jadikan db global agar bisa diakses oleh script.js nantinya
+  window.db = db;
+  window.firebaseCollection = collection;
+  window.firebaseSetDoc = setDoc;
+  window.firebaseDoc = doc;
+  window.firebaseOnSnapshot = onSnapshot;
+</script>
 
 <!-- App Script (loaded last so DOM is ready) -->
 <script src="script.js"></script>
