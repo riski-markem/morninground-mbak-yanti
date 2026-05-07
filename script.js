@@ -65,39 +65,97 @@ let extraFindingIdCounter = 0;
 
 // ════════════════════════════════════════════════════════
 // FIREBASE + LOCAL STORAGE HYBRID BACKEND
+// Arsitektur:
+//   • Firestore  = sumber kebenaran utama (source of truth)
+//   • localStorage = cache offline & fallback saat Firebase belum siap
+//   • Setiap tulis = 1 dokumen saja (bukan upload ulang seluruh array)
+//   • onSnapshot   = satu-satunya yang memperbarui cache lokal & UI
 // ════════════════════════════════════════════════════════
 
-// ── Helpers: akses window.db yang di-inject oleh Firebase module di index.html ──
-function _db()      { return window.db || null; }
-function _col()     { return window.firebaseCollection; }
-function _setDoc()  { return window.firebaseSetDoc; }
-function _doc()     { return window.firebaseDoc; }
-function _snap()    { return window.firebaseOnSnapshot; }
-function _fbReady() { return !!(window.db && window.firebaseSetDoc && window.firebaseDoc && window.firebaseCollection && window.firebaseOnSnapshot); }
+// ── Guard: cek apakah semua fungsi Firebase sudah di-inject ──────────
+function _fbReady() {
+  return !!(
+    window.db &&
+    window.firebaseSetDoc &&
+    window.firebaseDoc &&
+    window.firebaseCollection &&
+    window.firebaseOnSnapshot
+  );
+}
 
-// ── Status indikator sync (opsional, tampil di toast saat error) ──
+// ── Shorthand ke fungsi Firebase dari window ─────────────────────────
+const _db    = () => window.db;
+const _col   = () => window.firebaseCollection;
+const _setDoc= () => window.firebaseSetDoc;
+const _doc   = () => window.firebaseDoc;
+const _snap  = () => window.firebaseOnSnapshot;
+
+// ── Cache status error sync (satu toast saja, tidak spam) ────────────
 let _fbSyncError = false;
 
-// ── LocalStorage fallback (tetap dipakai sebagai cache offline) ──
-function getReports()  { try { return JSON.parse(localStorage.getItem('mr_v2_reports')||'[]'); } catch { return []; } }
-function saveReports(r){ localStorage.setItem('mr_v2_reports', JSON.stringify(r)); }
-function getNotifs()   { try { return JSON.parse(localStorage.getItem('mr_v2_notifs') ||'[]'); } catch { return []; } }
-function saveNotifs(n) { localStorage.setItem('mr_v2_notifs', JSON.stringify(n)); }
+// ════════════════════════════════════════════════════════
+// LOCAL STORAGE — cache offline & pembacaan saat offline
+// ════════════════════════════════════════════════════════
+function getReports() {
+  try { return JSON.parse(localStorage.getItem('mr_v2_reports') || '[]'); } catch { return []; }
+}
+function _cacheReports(arr) {
+  // Hanya tulis ke localStorage — TIDAK ke Firestore
+  // (Firestore ditulis hanya via fbSaveReport / fbSaveReportById)
+  localStorage.setItem('mr_v2_reports', JSON.stringify(arr));
+}
 
-// ── Tulis satu laporan ke Firestore (collection: "reports", doc id = report.id) ──
-async function fbSaveReport(report) {
-  if (!_fbReady()) return;
-  try {
-    // Firestore tidak boleh menyimpan undefined — bersihkan dulu
-    const clean = JSON.parse(JSON.stringify(report));
-    await _setDoc()(_doc()(_db(), 'reports', clean.id), clean);
-  } catch (e) {
-    console.error('[Firebase] Gagal menyimpan laporan:', e);
-    if (!_fbSyncError) { _fbSyncError = true; toast('⚠ Sync Firebase gagal, data tersimpan lokal', 'yellow'); }
+function getNotifs() {
+  try { return JSON.parse(localStorage.getItem('mr_v2_notifs') || '[]'); } catch { return []; }
+}
+function saveNotifs(notifsArray) {
+  localStorage.setItem('mr_v2_notifs', JSON.stringify(notifsArray));
+  // Sinkronisasi tiap notif ke Firestore (notif kecil, aman dikirim semua)
+  if (_fbReady() && Array.isArray(notifsArray)) {
+    notifsArray.forEach(n => fbSaveNotif(n));
   }
 }
 
-// ── Tulis satu notif ke Firestore (collection: "notifs", doc id = notif.id) ──
+// ════════════════════════════════════════════════════════
+// FIRESTORE WRITE — selalu tulis SATU dokumen, bukan array
+// ════════════════════════════════════════════════════════
+
+/**
+ * Simpan SATU laporan ke Firestore.
+ * Dipanggil oleh: submitForm, submitCloseFinding, doVerif, fbSaveReportById
+ */
+async function fbSaveReport(report) {
+  if (!_fbReady()) {
+    // Antrian ke localStorage saja; onSnapshot akan sync saat online kembali
+    console.warn('[Firebase] Belum siap, laporan tersimpan lokal saja:', report.id);
+    return;
+  }
+  try {
+    const clean = JSON.parse(JSON.stringify(report)); // buang undefined
+    await _setDoc()(_doc()(_db(), 'reports', clean.id), clean);
+    _fbSyncError = false;
+    console.log('[Firebase] Laporan tersimpan:', clean.id);
+  } catch (e) {
+    console.error('[Firebase] Gagal menyimpan laporan:', e);
+    if (!_fbSyncError) {
+      _fbSyncError = true;
+      toast('⚠ Sync Firebase gagal — data tersimpan lokal', 'yellow');
+    }
+  }
+}
+
+/**
+ * Ambil laporan dari cache lokal berdasarkan ID lalu push ke Firestore.
+ * Dipakai oleh submitCloseFinding & doVerif yang memodifikasi report di array cache.
+ */
+async function fbSaveReportById(reportId) {
+  const cached = getReports().find(r => r.id === reportId);
+  if (cached) await fbSaveReport(cached);
+}
+
+/**
+ * Simpan SATU notif ke Firestore.
+ */
 async function fbSaveNotif(notif) {
   if (!_fbReady()) return;
   try {
@@ -108,23 +166,39 @@ async function fbSaveNotif(notif) {
   }
 }
 
-// ── Realtime listener: Firestore → LocalStorage → re-render UI ──
-function initFirebaseListeners() {
+// ════════════════════════════════════════════════════════
+// saveReports — HANYA menulis ke localStorage cache
+// Penulisan ke Firestore WAJIB dilakukan eksplisit via fbSaveReport(report)
+// Ini mencegah upload ulang seluruh array setiap kali ada perubahan kecil
+// ════════════════════════════════════════════════════════
+function saveReports(reportsArray) {
+  _cacheReports(reportsArray);
+}
+
+// ════════════════════════════════════════════════════════
+// REALTIME LISTENER — Firestore → localStorage cache → UI
+// Didaftarkan sekali saat init. Jika Firebase belum siap,
+// di-retry dengan backoff eksponensial (bukan polling tetap).
+// ════════════════════════════════════════════════════════
+function initFirebaseListeners(attempt) {
+  attempt = attempt || 1;
+
   if (!_fbReady()) {
-    // Coba lagi setelah 1 detik (Firebase module mungkin belum selesai load)
-    setTimeout(initFirebaseListeners, 1000);
+    // Backoff: 500ms, 1s, 2s, 4s … maks 8s
+    const delay = Math.min(500 * Math.pow(2, attempt - 1), 8000);
+    console.log(`[Firebase] Belum siap, retry ke-${attempt} dalam ${delay}ms…`);
+    setTimeout(() => initFirebaseListeners(attempt + 1), delay);
     return;
   }
 
-  // Listener untuk collection "reports"
+  // ── Listener: collection "reports" ──────────────────────────────────
   _snap()(_col()(_db(), 'reports'), (snapshot) => {
     try {
       const fbReports = [];
       snapshot.forEach(docSnap => fbReports.push(docSnap.data()));
 
-      // Merge: ambil data Firebase sebagai sumber kebenaran
-      // tapi tetap simpan ke localStorage sebagai cache offline
-      saveReports(fbReports);
+      // Firebase = sumber kebenaran → overwrite cache lokal
+      _cacheReports(fbReports);
       _fbSyncError = false;
 
       // Re-render screen yang sedang aktif
@@ -136,26 +210,28 @@ function initFirebaseListeners() {
       if (activeScreen === 's-history')       renderHistory();
       if (activeScreen === 's-supervisor')    renderSupervisorDash();
       if (activeScreen === 's-open-findings') renderOpenFindings();
+
     } catch (e) {
-      console.error('[Firebase] Error saat memproses snapshot reports:', e);
+      console.error('[Firebase] Error memproses snapshot reports:', e);
     }
   }, (err) => {
     console.error('[Firebase] Listener reports error:', err);
-    toast('⚠ Koneksi Firebase terputus, mode offline aktif', 'yellow');
+    toast('⚠ Koneksi Firebase terputus — mode offline aktif', 'yellow');
   });
 
-  // Listener untuk collection "notifs"
+  // ── Listener: collection "notifs" ───────────────────────────────────
   _snap()(_col()(_db(), 'notifs'), (snapshot) => {
     try {
       const fbNotifs = [];
       snapshot.forEach(docSnap => fbNotifs.push(docSnap.data()));
-      // Urutkan: terbaru di depan
       fbNotifs.sort((a, b) => (b.id || '').localeCompare(a.id || ''));
-      saveNotifs(fbNotifs);
 
-      // Update notif dot
+      // Tulis ke cache lokal (tanpa trigger upload balik ke Firestore)
+      localStorage.setItem('mr_v2_notifs', JSON.stringify(fbNotifs));
+
+      // Update badge notif
       const unread = fbNotifs.filter(n => !n.read).length;
-      ['dash-notif-dot','sup-notif-dot'].forEach(id => {
+      ['dash-notif-dot', 'sup-notif-dot'].forEach(id => {
         const el = document.getElementById(id);
         if (el) el.style.display = unread ? 'block' : 'none';
       });
@@ -165,8 +241,9 @@ function initFirebaseListeners() {
         return el && el.classList.contains('active');
       });
       if (activeScreen === 's-notif') renderNotifs();
+
     } catch (e) {
-      console.error('[Firebase] Error saat memproses snapshot notifs:', e);
+      console.error('[Firebase] Error memproses snapshot notifs:', e);
     }
   }, (err) => {
     console.error('[Firebase] Listener notifs error:', err);
@@ -174,27 +251,6 @@ function initFirebaseListeners() {
 
   console.log('[Firebase] Realtime listeners aktif ✅');
 }
-
-// ── Override saveReports: simpan ke localStorage DAN Firestore ──
-// Dipanggil setiap kali ada perubahan pada array laporan
-const _origSaveReports = saveReports;
-saveReports = function(reportsArray) {
-  _origSaveReports(reportsArray);
-  // Sinkronisasi setiap laporan yang ada ke Firestore
-  // (Firestore pakai setDoc/merge jadi aman untuk update parsial)
-  if (_fbReady() && Array.isArray(reportsArray)) {
-    reportsArray.forEach(r => fbSaveReport(r));
-  }
-};
-
-// ── Override saveNotifs: simpan ke localStorage DAN Firestore ──
-const _origSaveNotifs = saveNotifs;
-saveNotifs = function(notifsArray) {
-  _origSaveNotifs(notifsArray);
-  if (_fbReady() && Array.isArray(notifsArray)) {
-    notifsArray.forEach(n => fbSaveNotif(n));
-  }
-};
 
 function today() { 
   const d = new Date();
@@ -693,9 +749,8 @@ function submitCloseFinding() {
   });
 
   saveReports(reps);
-  // Push laporan yang diupdate ke Firebase secara eksplisit
-  const updatedReport = reps.find(r => r.id === cfReportId);
-  if (updatedReport) fbSaveReport(updatedReport);
+  // ── Sinkronisasi dokumen yang diperbarui ke Firestore (satu dokumen saja) ──
+  fbSaveReportById(cfReportId);
   if (status === 'Closed') {
     const notifs = getNotifs();
     notifs.unshift({ id:'n-'+Date.now(), type:'finding_closed', title:'Temuan berhasil ditutup', body:`${cfFindingKey} — ${cfReportId}`, time: new Date().toLocaleTimeString('id-ID',{hour:'2-digit',minute:'2-digit'})+' WIB', read:false });
@@ -1031,7 +1086,10 @@ function submitForm(isDraft) {
 
   const reps = getReports();
   reps.push(report);
-  saveReports(reps);
+  saveReports(reps); // tulis ke localStorage cache
+
+  // ── Kirim ke Firestore secara eksplisit (satu dokumen, bukan seluruh array) ──
+  fbSaveReport(report);
 
   if (!isDraft) {
     const notifs = getNotifs();
@@ -1522,9 +1580,8 @@ function doVerif(action) {
     return r;
   });
   saveReports(reps);
-  // Push laporan yang diverifikasi ke Firebase secara eksplisit
-  const updatedRep = reps.find(r => r.id === selectedReport.id);
-  if (updatedRep) fbSaveReport(updatedRep);
+  // ── Sinkronisasi dokumen yang diverifikasi ke Firestore (satu dokumen saja) ──
+  fbSaveReportById(selectedReport.id);
   const notifs = getNotifs();
   notifs.unshift({ id:'n-'+Date.now(), type:'verif_done', title:`Laporan ${action==='approve'?'disetujui':'ditolak'}`, body: selectedReport.area + ' — ' + selectedReport.user.displayName, time: new Date().toLocaleTimeString('id-ID',{hour:'2-digit',minute:'2-digit'})+' WIB', read:false });
   saveNotifs(notifs);
@@ -1643,7 +1700,9 @@ function exportSinglePDF() {
   const { jsPDF } = window.jspdf;
   const r = selectedReport;
   const doc = new jsPDF();
+  const PAGE_W = doc.internal.pageSize.getWidth();
 
+  // ── Header teks ──────────────────────────────────────────
   doc.setFont('helvetica','bold'); doc.setFontSize(13);
   doc.text('LAPORAN MORNING ROUND DIGITAL', 14, 16);
   doc.setFont('helvetica','normal'); doc.setFontSize(8);
@@ -1651,20 +1710,152 @@ function exportSinglePDF() {
   doc.text(`Area: ${r.area} | ${r.tanggal} | Shift: ${r.shift} | Petugas: ${r.user.displayName}`, 14, 28);
   doc.text(`Skor 5R: ${r.skor5r}% | Status: ${r.status} | Persetujuan FM / Dept Head: ${r.verified ? (r.verif_action==='approve'?'DISETUJUI':'DITOLAK') : 'Belum'}`, 14, 34);
 
+  // ── Foto Area (Sebelum & Sesudah) ────────────────────────
+  // Foto ditempatkan berdampingan di bawah header, lebar ~85mm masing-masing
+  let nextY = 40;
+  const fotoW = 85; // mm
+  const fotoH = 48; // mm
+  const fotoGap = 6;
+  const fotoLabelH = 6;
+  const hasPhotos = r.foto_before || r.foto_after;
+
+  if (hasPhotos) {
+    // Label judul section
+    doc.setFont('helvetica','bold'); doc.setFontSize(7);
+    doc.setFillColor(17,17,17); doc.setTextColor(255,255,255);
+    doc.rect(14, nextY, PAGE_W - 28, 6, 'F');
+    doc.text('DOKUMENTASI KONDISI AREA', 16, nextY + 4.2);
+    doc.setTextColor(0,0,0); doc.setFont('helvetica','normal');
+    nextY += 8;
+
+    // Kotak foto Sebelum
+    const xBefore = 14;
+    doc.setDrawColor(17,17,17); doc.setLineWidth(0.4);
+    doc.rect(xBefore, nextY, fotoW, fotoH + fotoLabelH);
+    if (r.foto_before) {
+      try { doc.addImage(r.foto_before, 'JPEG', xBefore + 1, nextY + 1, fotoW - 2, fotoH - 2); } catch(e) {}
+    } else {
+      doc.setFontSize(7); doc.setTextColor(180,180,180);
+      doc.text('(Tidak Ada Foto)', xBefore + fotoW/2, nextY + fotoH/2, { align:'center' });
+      doc.setTextColor(0,0,0);
+    }
+    // Label bawah Sebelum
+    doc.setFillColor(240,240,240);
+    doc.rect(xBefore, nextY + fotoH, fotoW, fotoLabelH, 'F');
+    doc.setFont('helvetica','bold'); doc.setFontSize(7); doc.setTextColor(17,17,17);
+    doc.text('SEBELUM', xBefore + fotoW/2, nextY + fotoH + 4, { align:'center' });
+
+    // Kotak foto Sesudah
+    const xAfter = 14 + fotoW + fotoGap;
+    doc.setFont('helvetica','normal'); doc.setDrawColor(17,17,17);
+    doc.rect(xAfter, nextY, fotoW, fotoH + fotoLabelH);
+    if (r.foto_after) {
+      try { doc.addImage(r.foto_after, 'JPEG', xAfter + 1, nextY + 1, fotoW - 2, fotoH - 2); } catch(e) {}
+    } else {
+      doc.setFontSize(7); doc.setTextColor(180,180,180);
+      doc.text('(Tidak Ada Foto)', xAfter + fotoW/2, nextY + fotoH/2, { align:'center' });
+      doc.setTextColor(0,0,0);
+    }
+    // Label bawah Sesudah
+    doc.setFillColor(180,230,150);
+    doc.rect(xAfter, nextY + fotoH, fotoW, fotoLabelH, 'F');
+    doc.setFont('helvetica','bold'); doc.setFontSize(7); doc.setTextColor(17,17,17);
+    doc.text('SESUDAH', xAfter + fotoW/2, nextY + fotoH + 4, { align:'center' });
+
+    nextY += fotoH + fotoLabelH + 6;
+  }
+
+  // ── Tabel Checklist 5R ───────────────────────────────────
   const checkData = ITEMS_5R.map(i => [i.label, r.checklist?.[i.key]==='ok'?'OK':r.checklist?.[i.key]==='no'?'TIDAK':'N/A']);
-  doc.autoTable({ startY:40, head:[['Item 5R','Hasil']], body:checkData, styles:{fontSize:7.5}, headStyles:{fillColor:[17,17,17],textColor:255}, columnStyles:{0:{cellWidth:80},1:{cellWidth:25}} });
+  doc.autoTable({
+    startY: nextY,
+    head: [['Item 5R','Hasil']],
+    body: checkData,
+    styles: { fontSize: 7.5 },
+    headStyles: { fillColor:[17,17,17], textColor:255, fontStyle:'bold' },
+    columnStyles: { 0:{ cellWidth:120 }, 1:{ cellWidth:30, halign:'center' } }
+  });
+
+  // ── Tabel Temuan (dengan kolom Foto) ─────────────────────
+  // Kolom index: 0=Item, 1=DEPT, 2=Kategori, 3=Prioritas, 4=Status, 5=Deskripsi, 6=Foto Temuan, 7=Foto Perbaikan
+  const FOTO_COL_TEMUAN   = 6;
+  const FOTO_COL_PERBAIKAN = 7;
+  const FOTO_SIZE = 15; // mm — ukuran foto di dalam sel
 
   const allF = [
     ...Object.keys(r.findings||{}).map(k => {
-      const f=r.findings[k];
-      const item=ITEMS_5R.find(i=>i.key===k);
-      return [item?.label||k, f.dept||'—', f.category||'—', PRIO_LABELS[f.urgency]||f.urgency||'—', f.status, f.dueDate||'—', f.description||'—'];
+      const f    = r.findings[k];
+      const item = ITEMS_5R.find(i => i.key === k);
+      return [
+        item?.label || k,
+        f.dept        || '—',
+        f.category    || '—',
+        PRIO_LABELS[f.urgency] || f.urgency || '—',
+        f.status      || '—',
+        f.description || '—',
+        f.photo        || '',   // Foto Temuan (base64)
+        f.closingPhoto || ''    // Foto Perbaikan (base64)
+      ];
     }),
-    ...(r.extraFindings||[]).map(ef => [ef.label||'Temuan', ef.dept||'—', ef.category||'—', PRIO_LABELS[ef.priority]||ef.priority||'—', ef.status, ef.dueDate||'—', ef.description||'—'])
+    ...(r.extraFindings||[]).map(ef => [
+      ef.label       || 'Temuan',
+      ef.dept        || '—',
+      ef.category    || '—',
+      PRIO_LABELS[ef.priority] || ef.priority || '—',
+      ef.status      || '—',
+      ef.description || '—',
+      ef.photo        || '',
+      ef.closingPhoto || ''
+    ])
   ];
 
   if (allF.length) {
-    doc.autoTable({ startY: doc.lastAutoTable.finalY + 8, head:[['Item','DEPT','Kategori','Prioritas','Status','Target','Deskripsi']], body:allF, styles:{fontSize:6}, headStyles:{fillColor:[17,17,17],textColor:255} });
+    doc.autoTable({
+      startY: doc.lastAutoTable.finalY + 8,
+      head: [['Item','DEPT','Kategori','Prioritas','Status','Deskripsi','Foto Temuan','Foto Perbaikan']],
+      body: allF,
+      styles: { fontSize: 6, minCellHeight: 20, valign: 'middle' },
+      headStyles: { fillColor:[17,17,17], textColor:255, fontStyle:'bold' },
+      columnStyles: {
+        0: { cellWidth: 28 },
+        1: { cellWidth: 20 },
+        2: { cellWidth: 18 },
+        3: { cellWidth: 16 },
+        4: { cellWidth: 16 },
+        5: { cellWidth: 40 },
+        6: { cellWidth: 20, halign:'center' },
+        7: { cellWidth: 20, halign:'center' }
+      },
+      // Sembunyikan teks pada kolom foto (gambar akan di-render via hook)
+      didParseCell: function(data) {
+        if (data.section === 'body' &&
+           (data.column.index === FOTO_COL_TEMUAN || data.column.index === FOTO_COL_PERBAIKAN)) {
+          data.cell.text = []; // kosongkan teks agar base64 tidak muncul sebagai tulisan
+        }
+      },
+      // Render gambar ke dalam sel foto
+      didDrawCell: function(data) {
+        if (data.section !== 'body') return;
+        if (data.column.index !== FOTO_COL_TEMUAN && data.column.index !== FOTO_COL_PERBAIKAN) return;
+        const imgData = data.cell.raw;
+        if (!imgData || typeof imgData !== 'string' || imgData.length < 10) return;
+        try {
+          const cellX = data.cell.x;
+          const cellY = data.cell.y;
+          const cellW = data.cell.width;
+          const cellH = data.cell.height;
+          // Posisikan foto di tengah sel
+          const imgX = cellX + (cellW - FOTO_SIZE) / 2;
+          const imgY = cellY + (cellH - FOTO_SIZE) / 2;
+          doc.addImage(imgData, 'JPEG', imgX, imgY, FOTO_SIZE, FOTO_SIZE);
+        } catch(e) {
+          // Jika gambar gagal dirender, tampilkan placeholder teks
+          doc.setFontSize(5); doc.setTextColor(150,150,150);
+          doc.text('Gagal muat', data.cell.x + 2, data.cell.y + data.cell.height / 2);
+          doc.setTextColor(0,0,0);
+        }
+      }
+    });
   }
 
   doc.save(`MR_${r.area.replace(/ /g,'_')}_${r.tanggal}.pdf`);
